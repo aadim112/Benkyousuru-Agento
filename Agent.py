@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph,START, END
 from langchain_core.messages import HumanMessage
 from langfuse.langchain import CallbackHandler
 from typing import TypedDict, List, Dict, Any, Optional, Literal
+import json
 
 
 load_dotenv()
@@ -86,6 +87,8 @@ class LearningState(TypedDict):
     current_word: dict
     remaining_words: list
     kanjis: list
+    grammar_items: list
+    current_lesson: int
 
 model = ChatGoogleGenerativeAI(model="gemini-3.6-flash")
 
@@ -138,21 +141,31 @@ def get_daily_session(userid: int) -> dict:
     # Retrieving Todays Words
     total_vocab = cur.execute("""
         SELECT COUNT(*) FROM vocabulary
-        WHERE genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number =?)
-    """,(current_lesson,)).fetchone()[0]
+        WHERE genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+    """, (current_lesson,)).fetchone()[0]
 
     daily_vocab_limit = math.ceil(total_vocab / 5) if total_vocab else 0
-
-    new_vocab_rows = cur.execute("""
-        SELECT v.id, v.word, v.reading, v.meaning, v.accepted_answers
-        FROM vocabulary v
-        LEFT JOIN learner_vocabulary lv
-        ON lv.vocabulary_id = v.id AND lv.user_id = ?
-        WHERE v.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
-        AND lv.vocabulary_id IS NULL
-        ORDER BY v.id
-        LIMIT ?
-    """,(userid, current_lesson, daily_vocab_limit)).fetchall()
+    introduced_today = cur.execute("""
+        SELECT COUNT(*) FROM learner_vocabulary lv
+        JOIN vocabulary v ON v.id = lv.vocabulary_id
+        WHERE lv.user_id = ?
+        AND lv.introduced_on = DATE('now')
+        AND v.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+    """, (userid, current_lesson)).fetchone()[0]
+    if introduced_today >= daily_vocab_limit:
+        new_vocab_rows = []
+    else:
+        remaining_slots = daily_vocab_limit - introduced_today
+        new_vocab_rows = cur.execute("""
+            SELECT v.id, v.word, v.reading, v.meaning, v.accepted_answers
+            FROM vocabulary v
+            LEFT JOIN learner_vocabulary lv
+                ON lv.vocabulary_id = v.id AND lv.user_id = ?
+            WHERE v.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+            AND (lv.vocabulary_id IS NULL OR lv.introduced_on IS NULL)
+            ORDER BY v.id
+            LIMIT ?
+        """, (userid, current_lesson, remaining_slots)).fetchall()
 
     # Retriving Kanji
     total_kanji = cur.execute("""
@@ -162,16 +175,28 @@ def get_daily_session(userid: int) -> dict:
 
     daily_kanji_limit = math.ceil(total_kanji / 5) if total_kanji else 0
 
-    new_kanji_rows = cur.execute("""
-        SELECT k.id, k.character, k.meaning, k.onyomi, k.kunyomi, k.accepted_answers
-        FROM kanji k
-        LEFT JOIN learner_kanji lk
-            ON lk.kanji_id = k.id AND lk.user_id = ?
-        WHERE k.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
-          AND lk.kanji_id IS NULL
-        ORDER BY k.id
-        LIMIT ?
-    """, (userid, current_lesson, daily_kanji_limit)).fetchall()
+    introduced_kanji_today = cur.execute("""
+        SELECT COUNT(*) FROM learner_kanji lk
+        JOIN kanji k ON k.id = lk.kanji_id
+        WHERE lk.user_id = ?
+        AND lk.introduced_on = DATE('now')
+        AND k.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+    """, (userid, current_lesson)).fetchone()[0]
+
+    if introduced_kanji_today >= daily_kanji_limit:
+        new_kanji_rows = []
+    else:
+        remaining_kanji_slots = daily_kanji_limit - introduced_kanji_today
+        new_kanji_rows = cur.execute("""
+            SELECT k.id, k.character, k.meaning, k.onyomi, k.kunyomi, k.accepted_answers
+            FROM kanji k
+            LEFT JOIN learner_kanji lk
+                ON lk.kanji_id = k.id AND lk.user_id = ?
+            WHERE k.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+            AND (lk.kanji_id IS NULL OR lk.introduced_on IS NULL)
+            ORDER BY k.id
+            LIMIT ?
+        """, (userid, current_lesson, remaining_kanji_slots)).fetchall()
 
     # Retriving Grammar Paterns
     grammar_rows = cur.execute("""
@@ -185,12 +210,17 @@ def get_daily_session(userid: int) -> dict:
     conn.close()
 
     def to_vocab(row):
+        raw = row["accepted_answers"] or ""
+        try:
+            accepted = json.loads(raw) if raw.startswith("[") else raw.split(",")
+        except Exception:
+            accepted = raw.split(",")
         return {
             "vocabulary_id": row["id"],
             "word": row["word"],
             "reading": row["reading"],
             "meaning": row["meaning"],
-            "accepted": row["accepted_answers"].split(",") if row["accepted_answers"] else [],
+            "accepted": [a.strip() for a in accepted if a.strip()],
             "type": "vocabulary",
         }
 
@@ -224,33 +254,121 @@ def get_daily_session(userid: int) -> dict:
         "grammar":        [to_grammar(r) for r in grammar_rows],
     }
 
+
+def get_already_introduced_today(user_id: int, lesson_number: int) -> list:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    rows = cur.execute("""
+        SELECT v.id, v.word, v.reading, v.meaning, v.accepted_answers
+        FROM learner_vocabulary lv
+        JOIN vocabulary v ON v.id = lv.vocabulary_id
+        WHERE lv.user_id = ?
+          AND lv.introduced_on = DATE('now')
+          AND v.genki_lesson_id = (SELECT id FROM lessons WHERE lesson_number = ?)
+        ORDER BY v.id
+    """, (user_id, lesson_number)).fetchall()
+
+    conn.close()
+
+    def to_vocab(row):
+        raw = row["accepted_answers"] or ""
+        try:
+            accepted = json.loads(raw) if raw.startswith("[") else raw.split(",")
+        except Exception:
+            accepted = raw.split(",")
+        return {
+            "vocabulary_id": row["id"],
+            "word": row["word"],
+            "reading": row["reading"],
+            "meaning": row["meaning"],
+            "accepted": [a.strip() for a in accepted if a.strip()],
+            "type": "vocabulary",
+        }
+
+    return [to_vocab(r) for r in rows]
+
+def mark_as_introduced(user_id: int, vocab_items: list, kanji_items: list):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    for item in vocab_items:
+        cur.execute("""
+            INSERT INTO learner_vocabulary
+                (user_id, vocabulary_id, attempts, correct_attempts,
+                 incorrect_attempts, mastery, last_reviewed, next_review, introduced_on)
+            VALUES (?, ?, 0, 0, 0, 0.0, NULL, NULL, DATE('now'))
+            ON CONFLICT(user_id, vocabulary_id) DO UPDATE SET
+                introduced_on = COALESCE(introduced_on, DATE('now'))
+        """, (user_id, item["vocabulary_id"]))
+
+    for item in kanji_items:
+        cur.execute("""
+            INSERT INTO learner_kanji
+                (user_id, kanji_id, attempts, correct_attempts,
+                 incorrect_attempts, mastery, last_reviewed, next_review, introduced_on)
+            VALUES (?, ?, 0, 0, 0, 0.0, NULL, NULL, DATE('now'))
+            ON CONFLICT(user_id, kanji_id) DO UPDATE SET
+                introduced_on = COALESCE(introduced_on, DATE('now'))
+        """, (user_id, item["kanji_id"]))
+
+    conn.commit()
+    conn.close()
+
 def plan_daily_session(state: LearningState) -> LearningState:
-    session =  get_daily_session(state["userid"])
+    session = get_daily_session(state["userid"])
+
+    mark_as_introduced(state["userid"], session["new_vocab"], session["new_kanji"])
     print(f"\n📚 Today's Session — Lesson {session['current_lesson']}")
     print(f"   Review words : {len(session['review'])}")
     print(f"   New vocab    : {len(session['new_vocab'])}")
     print(f"   New kanji    : {len(session['new_kanji'])}")
     print(f"   Grammar      : {len(session['grammar'])} pattern(s)")
 
-    print(session["new_kanji"])
+    print("\nWhat would you like to do?")
+    print("  1. Start today's quiz (review + new words)")
+    print("  2. Browse today's words (no quiz)")
+    print("  3. Re-test today's words (words already introduced today)")
+
+    choice = input("Enter 1, 2 or 3: ").strip()
+
+    if choice == "2":
+        # Show all introduced-today words and exit
+        print("\n📖 Today's vocabulary:")
+        for v in session["new_vocab"]:
+            print(f"   {v['word']} ({v['reading']}) — {v['meaning']}")
+        print("\n📖 Today's kanji:")
+        for k in session["new_kanji"]:
+            print(f"   {k['character']} — {k['meaning']} | On: {k['onyomi']} Kun: {k['kunyomi']}")
+        return {**state, "remaining_words": [], "grammar_items": [], "current_lesson": session["current_lesson"], "kanjis": []}
+
+    if choice == "3":
+        # Re-test only already-introduced words (no new ones)
+        already_introduced = get_already_introduced_today(state["userid"], session["current_lesson"])
+        return {**state, "remaining_words": already_introduced, "grammar_items": session["grammar"], "current_lesson": session["current_lesson"], "kanjis": []}
+
+    # Default: choice 1 — normal daily session
     all_items = session["review"] + session["new_vocab"]
+    return {**state, "remaining_words": all_items, "grammar_items": session["grammar"], "current_lesson": session["current_lesson"], "kanjis": session["new_kanji"]}
 
-    if not all_items:
-        return {**state,"remaining_words": [],"grammar_items": session["grammar"],"current_lesson": session["current_lesson"],}
-
-    return {**state,"remaining_words": all_items,"grammar_items":   session["grammar"],"current_lesson":  session["current_lesson"],"kanjis": session["new_kanji"],}
-
-def ask_question(state: LearningState):
+def ask_question(state: LearningState) -> LearningState:
     if not state["remaining_words"]:
-        print("No vocabulary available for today's session.")
+        print("No items available for today's session.")
         return state
-    word = state["remaining_words"][0] 
+
+    item = state["remaining_words"][0]
     remaining = state["remaining_words"][1:]
 
     print(f"\n--- Round {state['round_number']} ---")
-    print(f"What does this word mean?  {word['word']} ({word['reading']})")
 
-    return {**state, "current_word": word,"remaining_words": remaining}
+    if item["type"] == "kanji":
+        print(f"What does this kanji mean?  {item['character']}")
+        print(f"On'yomi: {item['onyomi']}  |  Kun'yomi: {item['kunyomi']}")
+    else:
+        print(f"What does this word mean?  {item['word']} ({item['reading']})")
+
+    return {**state, "current_word": item, "remaining_words": remaining}
 
 def get_user_ans(state: LearningState):
     answer = input("Enter your answer: ").strip()
@@ -314,8 +432,9 @@ def wrong_feedback(state: LearningState):
  
  
 def show_results(state: LearningState):
+    total = state["round_number"] - 1
     print("\n--- Quiz complete ---")
-    print(f"Score: {state['score']} / {TOTAL_ROUNDS}")
+    print(f"Score: {state['score']} / {total}")
     return state
 
 
@@ -324,7 +443,7 @@ def route_on_correctness(state: LearningState) -> Literal["correct", "wrong"]:
     return "correct" if state["is_correct"] else "wrong"
 
 def route_next_round(state: LearningState) -> Literal["continue", "end"]:
-    if state["round_number"] > TOTAL_ROUNDS or not state["remaining_words"]:
+    if not state["remaining_words"]:
         return "end"
     return "continue"
 
@@ -335,8 +454,8 @@ def record_attempt(user_id: int, vocabulary_id: int, is_correct: int, user_answe
 
     cur.execute("""
         INSERT INTO learner_vocabulary
-            (user_id, vocabulary_id, attempts, correct_attempts,
-             incorrect_attempts, mastery, last_reviewed, next_review, introduced_on)
+        (user_id, vocabulary_id, attempts, correct_attempts,
+         incorrect_attempts, mastery, last_reviewed, next_review, introduced_on)
         VALUES
             (?, ?, 1, ?, ?, ?, CURRENT_TIMESTAMP, DATE('now', '+1 day'), DATE('now'))
         ON CONFLICT(user_id, vocabulary_id) DO UPDATE SET
@@ -345,7 +464,8 @@ def record_attempt(user_id: int, vocabulary_id: int, is_correct: int, user_answe
             incorrect_attempts = incorrect_attempts + ?,
             mastery            = (correct_attempts + ?) * 1.0 / (attempts + 1),
             last_reviewed      = CURRENT_TIMESTAMP,
-            next_review        = DATE('now', '+1 day')
+            next_review        = DATE('now', '+1 day'),
+            introduced_on      = COALESCE(introduced_on, DATE('now'))
     """, (user_id, vocabulary_id, correct_increment,1 - correct_increment,float(correct_increment),correct_increment,1 - correct_increment,correct_increment))
 
     if not is_correct:
@@ -354,14 +474,61 @@ def record_attempt(user_id: int, vocabulary_id: int, is_correct: int, user_answe
     conn.commit()
     conn.close()
 
-def record_result(state: LearningState):
-    record_attempt(
-        user_id       = state["userid"],
-        vocabulary_id = state["current_word"]["vocabulary_id"],
-        is_correct    = state["is_correct"],
-        user_answer   = state["user_answer"],
-        correct_answer= state["current_word"]["meaning"],
-    )
+def record_kanji_attempt(user_id: int, kanji_id: int, is_correct: bool,
+                         user_answer: str, correct_answer: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    correct_increment = 1 if is_correct else 0
+
+    cur.execute("""
+        INSERT INTO learner_kanji
+            (user_id, kanji_id, attempts, correct_attempts,
+             incorrect_attempts, mastery, last_reviewed, next_review, introduced_on)
+        VALUES
+            (?, ?, 1, ?, ?, ?, CURRENT_TIMESTAMP, DATE('now', '+1 day'), DATE('now'))
+        ON CONFLICT(user_id, kanji_id) DO UPDATE SET
+            attempts           = attempts + 1,
+            correct_attempts   = correct_attempts + ?,
+            incorrect_attempts = incorrect_attempts + ?,
+            mastery            = (correct_attempts + ?) * 1.0 / (attempts + 1),
+            last_reviewed      = CURRENT_TIMESTAMP,
+            next_review        = DATE('now', '+1 day')
+    """, (
+        user_id, kanji_id,
+        correct_increment, 1 - correct_increment, float(correct_increment),
+        correct_increment, 1 - correct_increment, correct_increment,
+    ))
+
+    if not is_correct:
+        cur.execute("""
+            INSERT INTO mistakes (user_id, item_type, item_id, user_answer, correct_answer)
+            VALUES (?, 'kanji', ?, ?, ?)
+        """, (user_id, kanji_id, user_answer, correct_answer))
+
+    conn.commit()
+    conn.close()
+
+def record_result(state: LearningState) -> LearningState:
+    word = state["current_word"]
+    item_type = word.get("type", "vocabulary")
+    print("Item Type: ",item_type)
+
+    if item_type == "vocabulary":
+        record_attempt(
+            user_id        = state["userid"],
+            vocabulary_id  = word["vocabulary_id"],
+            is_correct     = state["is_correct"],
+            user_answer    = state["user_answer"],
+            correct_answer = word["meaning"],
+        )
+    elif item_type == "kanji":
+        record_kanji_attempt(
+            user_id        = state["userid"],
+            kanji_id       = word["kanji_id"],
+            is_correct     = state["is_correct"],
+            user_answer    = state["user_answer"],
+            correct_answer = word["meaning"],
+        )
     return state
 
 def build_graph():
@@ -403,10 +570,8 @@ def main():
  
     app = build_graph()
 
-    words = get_vocab_words(13, "N4", TOTAL_ROUNDS)
-
     initial_state: LearningState = {
-        "remaining_words": words,
+        "remaining_words": [],
         "current_word": {},
         "user_answer": "",
         "is_correct": False,
